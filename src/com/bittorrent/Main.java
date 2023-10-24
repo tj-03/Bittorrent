@@ -1,6 +1,8 @@
 package com.bittorrent;
 import java.io.*;
 import java.net.*;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Properties;
@@ -54,6 +56,10 @@ public class Main {
 
         //Logger.log(commonCfg);
         //Logger.log(peerCfgs);
+        var path = Path.of("peer_" + hostId);
+        if(!Files.exists(path)){
+            Files.createDirectory(path);
+        }
         Server server = new Server(hostId, commonCfg, peerCfgs);
         try{
             server.start();
@@ -98,7 +104,7 @@ public class Main {
         while ((line = br.readLine()) != null) {
             String[] splitLine = line.split(" ");
             assert splitLine.length == 4;
-            var cfg = new PeerInfoCfg(Integer.parseInt(splitLine[0]), splitLine[1], Integer.parseInt(splitLine[2]), Boolean.parseBoolean(splitLine[3]));
+            var cfg = new PeerInfoCfg(Integer.parseInt(splitLine[0]), splitLine[1], Integer.parseInt(splitLine[2]), Integer.parseInt(splitLine[3]) != 0);
             peerInfoCfgs.add(cfg);
         }
         return peerInfoCfgs;

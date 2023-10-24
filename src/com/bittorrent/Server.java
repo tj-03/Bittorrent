@@ -31,7 +31,7 @@ public class Server {
         }
         assert this.hostConfig != null;
         Logger.log(this.hostConfig);
-        this.fileBitfield = new FileBitfield(commonCfg, this.hostConfig.hasFile());
+        this.fileBitfield = new FileBitfield(commonCfg, "peer_" + this.hostConfig.peerId(), this.hostConfig.hasFile());
     }
 
     public void start() throws IOException {
@@ -43,7 +43,7 @@ public class Server {
                 break;
             }
             Socket socket = new Socket(peerCfg.hostName(), peerCfg.port());
-            var handler = new ClientHandler(socket, this.hostConfig, peerCfg);
+            var handler = new ClientHandler(socket, this.fileBitfield, this.hostConfig, peerCfg, this.commonCfg);
             handlers.add(handler);
             handler.run();
         }
@@ -52,7 +52,7 @@ public class Server {
         //TODO: this thread will maybe eventually be responsible for updating handler choke/unchoked status
         while(handlers.size() != peerInfoCfgs.size() - 1){
             var socket = this.serverSocket.accept();
-            var handler = new ClientHandler(socket, this.hostConfig, null);
+            var handler = new ClientHandler(socket, this.fileBitfield, this.hostConfig, null, this.commonCfg);
             handlers.add(handler);
             handler.start();
         }
