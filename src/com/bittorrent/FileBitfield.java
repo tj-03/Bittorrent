@@ -10,13 +10,16 @@ public class FileBitfield {
     CommonCfg commonCfg;
     int numPieces;
     int lastPieceSize;
-    public FileBitfield(CommonCfg commonCfg) {
+    boolean haveFile;
+    public FileBitfield(CommonCfg commonCfg, boolean haveFile) throws BittorrentException{
         String fileName = commonCfg.fileName();
         int fileSize = commonCfg.fileSize();
         int pieceSize = commonCfg.pieceSize();
         this.numPieces = (int) Math.ceil(fileSize / pieceSize);
         this.lastPieceSize = fileSize % pieceSize;
+        this.haveFile = haveFile;
     }
+
 
     public ArrayList<Integer> calculateBitfield(){
         //TODO: implement

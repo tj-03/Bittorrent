@@ -1,49 +1,75 @@
 package com.bittorrent;
 
+import java.io.File;
 import java.io.IOException;
 import java.lang.reflect.Array;
 import java.net.ServerSocket;
+import java.net.Socket;
 import java.util.ArrayList;
 import java.util.concurrent.atomic.AtomicBoolean;
 
-record PeerInfoCfg(int peerId, String hostName, int port, boolean hasFile) { }
+record PeerInfoCfg(int peerId, String hostName, int port, boolean hasFile) {  }
 record CommonCfg(int numberOfPreferredNeighbors, int unchokingInterval, int optimisticUnchokingInterval, String fileName, int fileSize, int pieceSize) { }
 
 public class Server {
     CommonCfg commonCfg;
     ArrayList<PeerInfoCfg> peerInfoCfgs;
     ArrayList<ClientHandler> handlers;
-    int portNumber;
+
+    FileBitfield fileBitfield;
+    PeerInfoCfg hostConfig;
     ServerSocket serverSocket;
-    public Server(int port, CommonCfg commonCfg, ArrayList<PeerInfoCfg> peerInfoCfgs) {
+    public Server(int hostId, CommonCfg commonCfg, ArrayList<PeerInfoCfg> peerInfoCfgs) throws BittorrentException {
         this.commonCfg = commonCfg;
         this.peerInfoCfgs = peerInfoCfgs;
+        this.handlers = new ArrayList<>();
+        for (var peer: this.peerInfoCfgs) {
+            if(peer.peerId() == hostId){
+                this.hostConfig = peer;
+                break;
+            }
+        }
+        assert this.hostConfig != null;
+        Logger.log(this.hostConfig);
+        this.fileBitfield = new FileBitfield(commonCfg, this.hostConfig.hasFile());
     }
 
     public void start() throws IOException {
-        try {
-            this.serverSocket = new ServerSocket(this.portNumber);
-        }
-        catch (Exception e) {
-            System.out.println("Error creating server socket");
-            e.printStackTrace();
-        }
-        for (var peer: this.peerInfoCfgs) {
-            if(peer.port() == this.portNumber){
+            this.serverSocket = new ServerSocket(this.hostConfig.port());
+
+
+        for (var peerCfg: this.peerInfoCfgs) {
+            if(peerCfg.peerId() == this.hostConfig.peerId()){
                 break;
             }
-            var handler = new ClientHandler(peer.hostName(), peer.port());
+            Socket socket = new Socket(peerCfg.hostName(), peerCfg.port());
+            var handler = new ClientHandler(socket, this.hostConfig, peerCfg);
             handlers.add(handler);
             handler.run();
         }
 
         //TODO: we know how many peers there are, so we can just loop that many times
         //TODO: this thread will maybe eventually be responsible for updating handler choke/unchoked status
-        while(true){
+        while(handlers.size() != peerInfoCfgs.size() - 1){
             var socket = this.serverSocket.accept();
-            var handler = new ClientHandler(socket);
+            var handler = new ClientHandler(socket, this.hostConfig, null);
             handlers.add(handler);
-            handler.run();
+            handler.start();
         }
+
+        Logger.log("All peers connected");
+
+        shutdown();
+    }
+
+    void shutdown() {
+        for(var handler: this.handlers) {
+            try{
+                handler.join();
+            }
+            catch(InterruptedException e){
+                Logger.log("Thread interrupted on shutdown: " + e.getMessage());
+            }
+       }
     }
 }
