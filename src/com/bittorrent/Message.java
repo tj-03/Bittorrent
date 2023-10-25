@@ -99,7 +99,7 @@ public class Message {
 
     @Override
     public String toString(){
-        return "Message{type: %d, payload len: %d}".formatted(this.messageType, this.payload.length);
+        return "Message{type: %d, payload len: %d}".formatted(this.messageType, this.payload != null ? this.payload.length : 0);
     }
 
 }

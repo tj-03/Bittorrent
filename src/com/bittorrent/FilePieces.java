@@ -5,7 +5,8 @@ import java.util.ArrayList;
 import java.util.BitSet;
 import java.util.Collections;
 
-public class FileChunks {
+public class FilePieces {
+    //TODO: get rid of this and use BitSet instead
     public static class Bitfield{
         int numBits;
         int totalBits;
@@ -66,7 +67,7 @@ public class FileChunks {
 
     }
     ArrayList<byte[]> pieces;
-    CommonCfg commonCfg;
+    CommonConfig commonCfg;
     int numPieces;
     int fileSize;
     int pieceSize;
@@ -76,14 +77,16 @@ public class FileChunks {
     public Bitfield bitfield;
 
     boolean haveFile;
-    public FileChunks(CommonCfg commonCfg, String fileDirectory, boolean haveFile) throws BittorrentException{
+    public FilePieces(CommonConfig commonCfg, String fileDirectory, boolean haveFile) throws BittorrentException{
         this.fileSize = commonCfg.fileSize();
         this.pieceSize = commonCfg.pieceSize();
         this.numPieces = (int) Math.ceil((double)this.fileSize / this.pieceSize);
-        this.lastPieceSize = this.fileSize % this.pieceSize;
+        int remainder = this.fileSize % this.pieceSize;
+        this.lastPieceSize = remainder == 0 ? this.pieceSize : remainder;
         this.pieces = new ArrayList<>(Collections.nCopies(this.numPieces, null));
         this.bitfield = new Bitfield(this.numPieces);
         this.remainingPieces = this.numPieces;
+        this.commonCfg = commonCfg;
         if(haveFile){
             loadFile(fileDirectory + "/" + commonCfg.fileName());
             this.bitfield.setAll();
@@ -92,15 +95,35 @@ public class FileChunks {
         this.haveFile = haveFile;
     }
 
+    public void writeToFile(String fileDirectory){
+        if(!isComplete()){
+            Logger.log("warning: attempting to write incomplete file");
+            return;
+        }
+        File file = new File(fileDirectory + "/" + this.commonCfg.fileName());
+        try(OutputStream outputStream = new FileOutputStream(file);){
+            for(int i = 0; i < this.numPieces; i++){
+                int n = i == this.numPieces - 1 ? this.lastPieceSize : this.pieceSize;
+                outputStream.write(this.pieces.get(i), 0, n);
+            }
+        }
+        catch(IOException e){
+            Logger.log("error: " + e.getMessage());
+            return;
+        }
+        Logger.log(fileDirectory + "/" + this.commonCfg.fileName() + " successfully written");
+    }
     public synchronized void updatePiece(byte[] piece, int index) throws BittorrentException{
         if(index >= this.numPieces){
             throw new BittorrentException("index out of bounds");
         }
-        if(index == this.numPieces - 1 && piece.length != this.lastPieceSize){
-            throw new BittorrentException("piece size does not match expected piece size");
+        if((index == this.numPieces - 1) && (piece.length != this.lastPieceSize)){
+            throw new BittorrentException("piece size does not match expected piece size (expected: %d, actual: %d, index: %d"
+                    .formatted(this.lastPieceSize, piece.length, index));
         }
-        if(piece.length != this.pieceSize){
-            throw new BittorrentException("piece size does not match expected piece size");
+        if(index < this.numPieces - 1 && piece.length != this.pieceSize){
+            throw new BittorrentException("piece size does not match expected piece size (expected: %d, actual: %d. index: %d)"
+                    .formatted(this.pieceSize, piece.length, index));
         }
         if(this.bitfield.get(index)){
             return;
