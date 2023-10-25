@@ -18,11 +18,11 @@ public class Message {
     }
 
     public byte messageType;
-    public byte[] messagePayload;
+    public byte[] payload;
 
     Message(byte type, byte[] payload){
         this.messageType = type;
-        this.messagePayload = payload;
+        this.payload = payload;
     }
 
     public static Message fromInputStream(DataInputStream stream, int maxPayloadSize) throws IOException, BittorrentException {
@@ -45,19 +45,53 @@ public class Message {
     }
 
     public static void toOutputStream(DataOutputStream stream, Message message) throws IOException {
-        var buf = ByteBuffer.allocate(1 + 4 + message.messagePayload.length);
-        buf.putInt(message.messagePayload.length);
+        var buf = ByteBuffer.allocate(1 + 4 + (message.payload != null ? message.payload.length : 0));
+        buf.putInt(message.payload != null ? message.payload.length : 0);
         buf.put(message.messageType);
-        if(message.messagePayload.length != 0){
-            buf.put(message.messagePayload);
+        if(message.payload != null && message.payload.length != 0){
+            buf.put(message.payload);
         }
         stream.write(buf.array());
         stream.flush();
     }
 
+    public static void sendInterestedMessage(DataOutputStream stream) throws IOException {
+        var message = new Message((byte)MessageType.Interested.ordinal(), null);
+        Message.toOutputStream(stream, message);
+    }
+
+    public static void sendNotInterestedMessage(DataOutputStream stream) throws IOException {
+        var message = new Message((byte)MessageType.NotInterested.ordinal(), null);
+        Message.toOutputStream(stream, message);
+    }
+
+    public static void sendChokeMessage(DataOutputStream stream) throws IOException {
+        var message = new Message((byte)MessageType.Choke.ordinal(), null);
+        Message.toOutputStream(stream, message);
+    }
+
+    public static void sendUnchokeMessage(DataOutputStream stream) throws IOException {
+        var message = new Message((byte)MessageType.Unchoke.ordinal(), null);
+        Message.toOutputStream(stream, message);
+    }
+
+    public static void sendHaveMessage(DataOutputStream stream, int pieceIndex) throws IOException {
+        var buf = ByteBuffer.allocate(4);
+        buf.putInt(pieceIndex);
+        var message = new Message((byte)MessageType.Have.ordinal(), buf.array());
+        Message.toOutputStream(stream, message);
+    }
+
+    public static void sendRequestMessage(DataOutputStream stream, int pieceIndex) throws IOException {
+        var buf = ByteBuffer.allocate(4);
+        buf.putInt(pieceIndex);
+        var message = new Message((byte)MessageType.Request.ordinal(), buf.array());
+        Message.toOutputStream(stream, message);
+    }
+
     @Override
     public String toString(){
-        return "Message{type: %d, payload len: %d}".formatted(this.messageType, this.messagePayload.length);
+        return "Message{type: %d, payload len: %d}".formatted(this.messageType, this.payload.length);
     }
 
 }

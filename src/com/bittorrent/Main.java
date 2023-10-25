@@ -1,10 +1,8 @@
 package com.bittorrent;
 import java.io.*;
-import java.net.*;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.Properties;
 
 
@@ -19,7 +17,7 @@ public class Main {
         try {
             hostId = Integer.parseInt(args[0]);
         }
-        catch (Exception e) {
+        catch (NumberFormatException e) {
             System.out.println("Please enter a valid port number");
             return;
         }
@@ -97,7 +95,6 @@ public class Main {
 
     public static ArrayList<PeerInfoCfg> readPeerInfoCfgFile() throws IOException {
         FileReader reader = new FileReader("PeerInfo.cfg");
-        Properties prop = new Properties();
         BufferedReader br = new BufferedReader(reader);
         String line;
         ArrayList<PeerInfoCfg> peerInfoCfgs = new ArrayList<>();
@@ -107,6 +104,7 @@ public class Main {
             var cfg = new PeerInfoCfg(Integer.parseInt(splitLine[0]), splitLine[1], Integer.parseInt(splitLine[2]), Integer.parseInt(splitLine[3]) != 0);
             peerInfoCfgs.add(cfg);
         }
+        br.close();
         return peerInfoCfgs;
     }
 }
