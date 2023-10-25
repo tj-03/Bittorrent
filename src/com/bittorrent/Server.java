@@ -87,7 +87,7 @@ public class Server {
             Socket socket = new Socket(peerCfg.hostName(), peerCfg.port());
             var handler = new PeerHandler(socket, this.fileBitfield, this.hostConfig, peerCfg, this.commonCfg);
             handlers.add(handler);
-            handler.run();
+            handler.start();
         }
 
         //TODO?: not sure if we should wait for all peers before starting

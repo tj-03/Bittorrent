@@ -89,6 +89,14 @@ public class Message {
         Message.toOutputStream(stream, message);
     }
 
+    public static void sendPieceMessage(DataOutputStream stream, int pieceIndex, byte[] pieceData) throws IOException {
+        var buf = ByteBuffer.allocate(4 + pieceData.length);
+        buf.putInt(pieceIndex);
+        buf.put(pieceData);
+        var message = new Message((byte)MessageType.Piece.ordinal(), buf.array());
+        Message.toOutputStream(stream, message);
+    }
+
     @Override
     public String toString(){
         return "Message{type: %d, payload len: %d}".formatted(this.messageType, this.payload.length);

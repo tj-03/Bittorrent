@@ -110,6 +110,19 @@ public class FileChunks {
         this.bitfield.set(index);
     }
 
+    public byte[] getPiece(int index){
+        synchronized(this.bitfield){
+            if(index < 0 || index >= this.numPieces){
+                return null;
+            }
+            if(!this.bitfield.get(index)){
+                return null;
+            }
+        }
+        return this.pieces.get(index);
+
+    }
+
     public synchronized boolean isComplete(){
         return this.remainingPieces == 0;
     }

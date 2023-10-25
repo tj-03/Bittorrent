@@ -149,7 +149,6 @@ public class PeerHandler extends Thread{
     void handleMessage(Message message) throws BittorrentException, IOException{
       
         switch (message.messageType){
-
             //Interested, NotInterested
             case 2:
             case 3:{
@@ -185,7 +184,20 @@ public class PeerHandler extends Thread{
             //request message
             case 6:{
                 Logger.log("Received request message");
-                //TODO: implement request handling
+                if(this.shouldChoke.get()){
+                    Logger.log("warning: received request message when choked");
+                    return;
+                }
+                int pieceIndex = ByteBuffer.wrap(message.payload).getInt();
+
+                byte[] piece = this.filePieces.getPiece(pieceIndex);
+                if(piece == null){
+                    Logger.log("warning: either dont have piece or piece index is out of bounds - index = " + pieceIndex);
+                    return;
+                }
+                Logger.log("sending piece message");
+                Message.sendPieceMessage(this.writer, pieceIndex, piece);
+                break;
             }
             //piece message
             case 7:{
@@ -220,6 +232,7 @@ public class PeerHandler extends Thread{
         int pieceIndex = this.piecesToRequest.get(randomIndex);
         this.piecesToRequest.set(pieceIndex, this.piecesToRequest.get(this.piecesToRequest.size() - 1));
         this.piecesToRequest.set(this.piecesToRequest.size() - 1, pieceIndex);
+        Logger.log("Requesting piece " + pieceIndex);
         Message.sendRequestMessage(writer, pieceIndex);
         this.waitingForPiece = true;
     }
