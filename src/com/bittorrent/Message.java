@@ -14,13 +14,22 @@ public class Message {
         Have,
         Bitfield,
         Request,
-        Piece
+        Piece;
+
+        public static MessageType fromByte(byte b){
+            for(var t: MessageType.values()){
+                if(t.ordinal() == b){
+                    return t;
+                }
+            }
+            return null;
+        }
     }
 
-    public byte messageType;
+    public MessageType messageType;
     public byte[] payload;
 
-    Message(byte type, byte[] payload){
+    Message(MessageType type, byte[] payload){
         this.messageType = type;
         this.payload = payload;
     }
@@ -30,16 +39,9 @@ public class Message {
         if(messageLength > maxPayloadSize){
             throw new BittorrentException("message length to big: " + messageLength);
         }
-        var messageType = stream.readByte();
-        if(messageType > 7){
-            throw new BittorrentException("invalid message type: " + messageType);
-        }
-
-        //choke, unchoke, interested, not interested
-        if(messageType <=  3){
-            if(messageLength != 0)
-                throw new BittorrentException("invalid payload size %d for message type %b".formatted(messageLength, messageType));
-            return new Message(messageType, null);
+        var messageType = MessageType.fromByte(stream.readByte());
+        if(messageType == null){
+            throw new BittorrentException("invalid message type byte: " + messageType);
         }
         return new Message(messageType, stream.readNBytes(messageLength));
     }
@@ -47,7 +49,7 @@ public class Message {
     public static void toOutputStream(DataOutputStream stream, Message message) throws IOException {
         var buf = ByteBuffer.allocate(1 + 4 + (message.payload != null ? message.payload.length : 0));
         buf.putInt(message.payload != null ? message.payload.length : 0);
-        buf.put(message.messageType);
+        buf.put((byte)message.messageType.ordinal());
         if(message.payload != null && message.payload.length != 0){
             buf.put(message.payload);
         }
@@ -56,36 +58,36 @@ public class Message {
     }
 
     public static void sendInterestedMessage(DataOutputStream stream) throws IOException {
-        var message = new Message((byte)MessageType.Interested.ordinal(), null);
+        var message = new Message(MessageType.Interested, null);
         Message.toOutputStream(stream, message);
     }
 
     public static void sendNotInterestedMessage(DataOutputStream stream) throws IOException {
-        var message = new Message((byte)MessageType.NotInterested.ordinal(), null);
+        var message = new Message(MessageType.NotInterested, null);
         Message.toOutputStream(stream, message);
     }
 
     public static void sendChokeMessage(DataOutputStream stream) throws IOException {
-        var message = new Message((byte)MessageType.Choke.ordinal(), null);
+        var message = new Message(MessageType.Choke, null);
         Message.toOutputStream(stream, message);
     }
 
     public static void sendUnchokeMessage(DataOutputStream stream) throws IOException {
-        var message = new Message((byte)MessageType.Unchoke.ordinal(), null);
+        var message = new Message(MessageType.Unchoke, null);
         Message.toOutputStream(stream, message);
     }
 
     public static void sendHaveMessage(DataOutputStream stream, int pieceIndex) throws IOException {
         var buf = ByteBuffer.allocate(4);
         buf.putInt(pieceIndex);
-        var message = new Message((byte)MessageType.Have.ordinal(), buf.array());
+        var message = new Message(MessageType.Have, buf.array());
         Message.toOutputStream(stream, message);
     }
 
     public static void sendRequestMessage(DataOutputStream stream, int pieceIndex) throws IOException {
         var buf = ByteBuffer.allocate(4);
         buf.putInt(pieceIndex);
-        var message = new Message((byte)MessageType.Request.ordinal(), buf.array());
+        var message = new Message(MessageType.Request, buf.array());
         Message.toOutputStream(stream, message);
     }
 
@@ -93,7 +95,7 @@ public class Message {
         var buf = ByteBuffer.allocate(4 + pieceData.length);
         buf.putInt(pieceIndex);
         buf.put(pieceData);
-        var message = new Message((byte)MessageType.Piece.ordinal(), buf.array());
+        var message = new Message(MessageType.Piece, buf.array());
         Message.toOutputStream(stream, message);
     }
 
@@ -101,5 +103,4 @@ public class Message {
     public String toString(){
         return "Message{type: %d, payload len: %d}".formatted(this.messageType, this.payload != null ? this.payload.length : 0);
     }
-
 }

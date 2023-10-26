@@ -15,6 +15,7 @@ import java.util.concurrent.Semaphore;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 
+
 public class PeerHandler extends Thread{
     Socket socket;
     //ClientHandler -> peer
@@ -157,7 +158,7 @@ public class PeerHandler extends Thread{
         }
         shouldStop.set(true);
         //send one more message to queue to unblock the processMessageQueue method
-        this.messageQueue.add(new Message((byte)0, new byte[0]));
+        this.messageQueue.add(new Message(Message.MessageType.Choke, new byte[0]));
         peerHandlerLog("Reader for peer " + this.peerInfoCfg.peerId() + " is done");
     }
 
@@ -205,24 +206,24 @@ public class PeerHandler extends Thread{
       
         switch (message.messageType){
             //Choke
-            case 0:{
+            case Choke:{
                 peerHandlerLog("Received choke message");
                 this.peerHasChoked = true;
                 break;
             }
             //Unchoke
-            case 1:{
+            case Unchoke:{
                 peerHandlerLog("Received unchoke message");
                 this.peerHasChoked = false;
                 break;
             }
             //Interested, NotInterested
-            case 2:{
+            case Interested:{
                 peerHandlerLog("Received interested message");
                 this.peerIsInterested.set(true);
                 break;
             }
-            case 3:{
+            case NotInterested:{
                 peerHandlerLog("Received uninterested message");
                 this.peerIsInterested.set(false);
                 if(filePieces.isComplete()){
@@ -232,7 +233,7 @@ public class PeerHandler extends Thread{
                 break;
             }
             //Have
-            case 4:{
+            case Have:{
                 if(message.payload.length != 4){
                     Logger.log("error: have message payload is not 4 bytes");
                     throw new BittorrentException("Have message payload is not 4 bytes");
@@ -261,7 +262,7 @@ public class PeerHandler extends Thread{
                 break;
             }
             //Bitfield message
-            case 5:{
+            case Bitfield:{
                 peerHandlerLog("Received bitfield message");
                 this.peerBitfield = new FilePieces.Bitfield(message.payload, this.numPieces);
                 this.piecesToRequest = filePieces.bitfield.getInterestedIndices(this.peerBitfield); 
@@ -275,7 +276,7 @@ public class PeerHandler extends Thread{
                 break;
             }
             //request message
-            case 6:{
+            case Request:{
                 peerHandlerLog("Received request message");
                 if(this.shouldChoke.get()){
                     peerHandlerLog("warning: received request message when choked");
@@ -293,7 +294,7 @@ public class PeerHandler extends Thread{
                 break;
             }
             //piece message
-            case 7:{
+            case Piece:{
                 
                 if(!this.waitingForPiece){
                     peerHandlerLog("warning: received piece message when not waiting for piece");
@@ -385,7 +386,7 @@ public class PeerHandler extends Thread{
     void sendBitfield(){
         try{
             var bitfieldBytes = this.filePieces.bitfield.getBytes();
-            Message message = new Message((byte)Message.MessageType.Bitfield.ordinal(), bitfieldBytes);
+            Message message = new Message(Message.MessageType.Bitfield, bitfieldBytes);
             Message.toOutputStream(this.writer, message);
         }
         catch (IOException e){
