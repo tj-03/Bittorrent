@@ -15,42 +15,62 @@ import java.util.concurrent.Semaphore;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 
-
-public class PeerHandler extends Thread{
+enum EventType{
+    PieceReceived,
+    //Sent if disconnect
+    //shutdownSignal MUST be true if disconnect was due to error
+    DisconnectedFromPeer
+}
+record Event(EventType type, int peerId, int pieceIndex){}
+public class PeerHandler extends Thread implements PeerListener{
     Socket socket;
+    DataInputStream reader;
+    DataOutputStream writer;
+
     //ClientHandler -> peer
     AtomicBoolean shouldChoke;
-    //TODO: graceful shutdown for handler and server
-    AtomicBoolean shouldStop;
     //peer -> ClientHandler
     boolean peerHasChoked;
+    //Used in server to determine if we should optimistically uncloke peer
+    AtomicBoolean peerIsInterested = new AtomicBoolean(false);
+    //piece index of piece we are currently requesting
+    //if there is no piece in flight, this should be -1
+    int pieceIndexInFlight = -1;
+    ArrayList<Integer> piecesToRequest = new ArrayList<>();
+
+    //TODO: graceful shutdown for handler and server
+    AtomicBoolean handlerShutdownSignal;
+    //only accounts for piece message payload size
+    int bytesDownloadedSinceChokeInterval = 0;
+
     FilePieces filePieces;
     FilePieces.Bitfield peerBitfield;
 
-    PeerInfoConfig peerInfoCfg;
-    
-    
-
-    //only accounts for piece message payload size
-    int bytesDownloadedSinceChokeInterval = 0;
     PeerInfoConfig hostCfg;
-    DataInputStream reader;
-    DataOutputStream writer;
-    Thread readerThread;
-    BlockingQueue<Message> messageQueue;
+    PeerInfoConfig peerInfoCfg;
     int pieceSize;
     int numPieces;
-    boolean waitingForPiece = false;
-    ArrayList<Integer> piecesToRequest = new ArrayList<>();
-    Semaphore chokeSemaphore;
-    AtomicBoolean peerIsInterested = new AtomicBoolean(false);
-    ConcurrentLinkedQueue<Event> outboundEventQueue;
+    
+    Thread readerThread;
+    BlockingQueue<Message> messageQueue;
+    //Used to notify server thread that we have received a message and it should publish it to all peerHandlers
+    //Also used to notify server thread we have disconnected, so it can remove us from its list of peerHandlers
+    ServerListener serverListener;
+    //Queue that we receive PieceReceived events from
     ConcurrentLinkedQueue<Event> inboundEventQueue = new ConcurrentLinkedQueue<>();
+    //Used to wait on multiple queues at once (messageQueue and inboundEventQueue)
+    Semaphore queueSemaphore = new Semaphore(0);
+    //Used to atomically add items to queue and release semaphore as one operation
+    Object queueLock = new Object();
+    //Used to update the download rate, 
+    Semaphore chokeSemaphore;
+    boolean shutdownByServer = false;
 
 
-    public PeerHandler(Socket socket, FilePieces fileBitfield, PeerInfoConfig hostCfg, PeerInfoConfig peerInfoCfg, CommonConfig commonCfg, ConcurrentLinkedQueue<Event> eventQueue, Semaphore chokeSemaphore) {
+
+    public PeerHandler(Socket socket, FilePieces fileBitfield, PeerInfoConfig hostCfg, PeerInfoConfig peerInfoCfg, CommonConfig commonCfg, ServerListener listener, Semaphore chokeSemaphore) {
         shouldChoke = new AtomicBoolean(true);
-        shouldStop = new AtomicBoolean(false);
+        handlerShutdownSignal = new AtomicBoolean(false);
         this.peerHasChoked = true;
         //arbitrary capacity of 64, should be fine
         this.messageQueue = new ArrayBlockingQueue<>(64);
@@ -61,8 +81,20 @@ public class PeerHandler extends Thread{
         this.pieceSize = commonCfg.pieceSize();
         this.numPieces = (int)Math.ceil((double)commonCfg.fileSize() / commonCfg.pieceSize());
         this.peerBitfield = new FilePieces.Bitfield(this.numPieces);
-        this.outboundEventQueue = eventQueue;
+        this.serverListener = listener;
         this.chokeSemaphore = chokeSemaphore;
+    }
+
+    public void chokePeer(){
+        this.shouldChoke.set(true);
+    }
+
+    public void unchokePeer(){
+        this.shouldChoke.set(false);
+    }
+
+    public boolean isChokingPeer(){
+        return this.shouldChoke.get();
     }
 
     //Reads and writes handhsake
@@ -98,87 +130,270 @@ public class PeerHandler extends Thread{
 
     }
 
-    void shutdown()  {
-        peerHandlerLog("Shutting down ...");
-        try{
-            this.socket.close();
-            if(this.readerThread != null && this.readerThread.isAlive()){
-                this.readerThread.join();
-            }
-        }
-        catch (IOException e){
-            peerHandlerLog("There was an error closing the socket for peer");
-        }
-        catch (InterruptedException e){
-            peerHandlerLog("There was an error joining the reader thread");
-        }
-        finally{
-            int peerId = this.peerInfoCfg != null ? this.peerInfoCfg.peerId() : -1;
-            this.outboundEventQueue.add(new Event(EventType.DisconnectedFromPeer, peerId, -1));
-            peerHandlerLog("Peer handler for peer " + peerId + " successfully shut down");
-        }
-
-    }
-
     //meant to run in separate thread
 
     //TODO: URGENT -> errors should stop the thread entirely, and we need a way to update the main thread that we are done serving this client
     void readMessages() {
         peerHandlerLog("Reading messages");
-        while(!shouldStop.get()){
+        while(!handlerShutdownSignal.get()){
             try{
                 var message = Message.fromInputStream(this.reader, this.pieceSize + 4);
-
-                this.messageQueue.put(message);
+                //add message to queue and release semaphore
+                onMessage(message);
             }
             catch(SocketTimeoutException e){
                 peerHandlerLog("error: socket timed out, we should not be waiting this long");
-                break;
+                notifyThreadsToStop();
+                return;
             }
-            catch(SocketException e){
-                peerHandlerLog("There was an error with the socket " + e.getMessage());
-                break;
-            }
-            catch (IOException e){
-                peerHandlerLog("There was an error reading from the socket");
-                e.printStackTrace();
-                break;
+            catch(IOException e){
+                //TODO: add better log, some of these errors are intentional and signal successful shutdown
+                peerHandlerLog("There was an error with the socket: " + e.getMessage());
+                notifyThreadsToStop();
+                return;
             }
             catch (BittorrentException e){
                 peerHandlerLog("There was an error parsing the message");
                 e.printStackTrace();
-                break;
+                notifyThreadsToStop();
+                return;
             }
-            catch (InterruptedException e){
-                peerHandlerLog("There was an error putting the message in the queue");
-                e.printStackTrace();
-                break;
-            }
-
         }
-        shouldStop.set(true);
-        //send one more message to queue to unblock the processMessageQueue method
-        this.messageQueue.add(new Message(Message.MessageType.Choke, new byte[0]));
+        
+        //if we broke out of the loop that means this was already called
+        //onShutdown();
         peerHandlerLog("Reader for peer " + this.peerInfoCfg.peerId() + " is done");
     }
 
-    //TODO: URGENT -> errors should stop the thread entirely, and we need a way to update the main thread that we are done serving this client
-    void processMessageQueue() throws IOException, BittorrentException, InterruptedException {
-        peerHandlerLog("Processing messages");
-        boolean prevChokeStatus = true;
-        while(!shouldStop.get()){
-            boolean shouldChoke = this.shouldChoke.get();
-            var event = this.inboundEventQueue.poll();
-            if(event != null && event.type() == EventType.PieceReceived){
-                peerHandlerLog("Received %d piece from peer %d, sending HAVE message".formatted(event.pieceIndex(), event.peerId()));
-                Message.sendHaveMessage(writer, event.pieceIndex());
-                this.piecesToRequest.removeIf((Integer i) -> i == event.pieceIndex());
-                if(this.piecesToRequest.isEmpty()){
-                    peerHandlerLog("Sending not interested message after receiving piece %d from different peer %d".formatted(event.pieceIndex(), event.peerId()));
+    //Add item to queue and release semaphore as one atomic operation
+    //Semaphore acts as notification that there is an item in the queue
+    public void onPieceReceived(Event event){
+        synchronized(this.queueLock){
+            Logger.log("adding piece received event to queue");
+            this.inboundEventQueue.add(event);
+            this.queueSemaphore.release();
+        }
+        
+    }       
+    //Add item to queue and release semaphore as one atomic operation
+    //Semaphore acts as notification that there is an item in the queue
+    public void onMessage(Message message){
+        synchronized(this.queueLock){
+            this.messageQueue.add(message);
+            this.queueSemaphore.release();
+        }
+    }
+
+    //Processes pieceReceived events from queue, which signals that we have received a piece from a different peer
+    //This should send a HAVE message to peer and remove the piece from the list of pieces to request
+    //If we have all the pieces our peer has to offer, we should send a NOT_INTERESTED message
+    //If we and the peer have all the pieces, we should disconnect
+    //returns true if shutdown was triggered
+    boolean processPieceReceivedEvent(ArrayList<Event> events) throws IOException {
+        for(var event: events){
+            if(event.type() != EventType.PieceReceived){
+                //TODO: remove
+                throw new RuntimeException("received invalid event type in pieceReceived handler");
+            }
+            peerHandlerLog("[PIECE_RECEIVED_EV] Received piece %d from peer %d, sending HAVE message".formatted(event.pieceIndex(), event.peerId()));
+            Message.sendHaveMessage(writer, event.pieceIndex());
+            int pieceIndex = event.pieceIndex();
+            this.piecesToRequest.removeIf((Integer j) -> j == pieceIndex);
+            if(this.piecesToRequest.isEmpty()){
+                peerHandlerLog("Sending not interested message after receiving piece %d from different peer %d".formatted(event.pieceIndex(), event.peerId()));
+                Message.sendNotInterestedMessage(this.writer);
+            }
+            boolean shutdownTriggered = bothPeersHaveCompleteFile("disconnecting after receiving piece from other peer(%d)".formatted(event.peerId()));
+            if(shutdownTriggered){
+                return true;
+            }
+        }
+        return false;
+    }
+
+    boolean processMessages(ArrayList<Message> messages, boolean choked) throws BittorrentException, IOException{
+        for(var message: messages){
+            boolean shutdownTriggered = handleMessage(message, choked);
+            if(shutdownTriggered){
+                return true;
+            }
+        }
+        return false;
+    }
+
+    boolean requestInFlight(){
+        return this.pieceIndexInFlight != -1;
+    }
+
+    void cancelInFlightRequest(){
+        this.pieceIndexInFlight = -1;
+    }
+
+    //Select a random piece from the list of pieces to request and send a request message
+    //Move the requested index to the back of the list to be popped once we receive the piece (more efficient than remove())
+    //Set the pieceIndexInFlight to the requested piece
+    void requestPiece() throws IOException{
+        if(this.piecesToRequest.size() == 0){
+            return;
+        }
+        int randomIndex = (int)(Math.random() * this.piecesToRequest.size());        
+        int pieceIndex = this.piecesToRequest.get(randomIndex);
+        this.piecesToRequest.set(randomIndex, this.piecesToRequest.get(this.piecesToRequest.size() - 1));
+        this.piecesToRequest.set(this.piecesToRequest.size() - 1, pieceIndex);
+        peerHandlerLog("Requesting piece " + pieceIndex);
+        Message.sendRequestMessage(writer, pieceIndex);
+        this.pieceIndexInFlight = pieceIndex;
+    }
+
+    boolean handleHaveMessage(Message message) throws IOException, BittorrentException{
+        peerHandlerLog("Received have message");
+        var pieceIndex = ByteBuffer.wrap(message.payload).getInt();
+        if(pieceIndex < 0 || pieceIndex >= this.numPieces){
+            throw new BittorrentException("invalid piece index: " + pieceIndex);
+        }
+        this.peerBitfield.set(pieceIndex);
+        if(!this.filePieces.bitfield.havePiece(pieceIndexInFlight)){
+            if(requestInFlight()){
+                this.piecesToRequest.set(this.piecesToRequest.size() -1, pieceIndex);
+                this.piecesToRequest.add(this.pieceIndexInFlight);
+            }
+            else{
+                this.piecesToRequest.add(pieceIndex);
+            }
+            Message.sendInterestedMessage(this.writer);
+        }
+        return bothPeersHaveCompleteFile("disconnecting after receiving have message from peer");
+    }
+    void handleRequestMessage(Message message, boolean choked) throws BittorrentException, IOException{
+        int pieceIndex = ByteBuffer.wrap(message.payload).getInt();
+        peerHandlerLog("Received request message for piece " + pieceIndex);
+        if(choked){
+            peerHandlerLog("[WARNING]: Received request message while choked");
+            return;
+        }
+        if(pieceIndex < 0 || pieceIndex >= this.numPieces){
+            throw new BittorrentException("invalid piece index: " + pieceIndex);
+        }
+        if(!this.peerIsInterested.get()){
+            throw new BittorrentException("peer requested piece while not interested");
+        }
+        byte[] piece = this.filePieces.getPiece(pieceIndex);
+        if(piece == null){
+            throw new BittorrentException("peer requested piece index %d which we do not have".formatted(pieceIndex));
+        }
+        Message.sendPieceMessage(this.writer, pieceIndex, piece);
+    }
+
+    boolean handlePieceMessage(Message message) throws BittorrentException{
+        ByteBuffer buf = ByteBuffer.wrap(message.payload);
+        int pieceIndex = buf.getInt();
+        peerHandlerLog("Received piece message for piece " + pieceIndex);
+        if(pieceIndex < 0 || pieceIndex >= this.numPieces){
+            throw new BittorrentException("invalid piece index: " + pieceIndex);
+        }
+        if(pieceIndex != this.pieceIndexInFlight){
+            throw new BittorrentException("received piece message for piece index %d while expecting piece index %d".formatted(pieceIndex, this.pieceIndexInFlight));
+        }
+        //If this happens we messed up, since the requestInFlight check should have caught this
+        if(this.filePieces.bitfield.havePiece(pieceIndex)){
+            throw new BittorrentException("received piece message for piece index %d which we already have (this is an error on our side)".formatted(pieceIndex));
+        }
+        byte[] byteArray = buf.array();
+        var piece = Arrays.copyOfRange(byteArray, 4, byteArray.length);
+        this.filePieces.updatePiece(piece, pieceIndex);
+        this.chokeSemaphore.acquireUninterruptibly();
+        this.bytesDownloadedSinceChokeInterval += piece.length;
+        this.chokeSemaphore.release();
+        this.cancelInFlightRequest();
+        this.piecesToRequest.remove(this.piecesToRequest.size() - 1);
+        int peerId = this.peerInfoCfg != null ? this.peerInfoCfg.peerId() : -1;
+        this.serverListener.onPieceReceived(pieceIndex, peerId);
+        return bothPeersHaveCompleteFile("disconnecting after receiving piece %d from peer".formatted(pieceIndex));
+    }
+
+    boolean handleMessage(Message message, Boolean choked) throws BittorrentException, IOException{
+        switch(message.messageType){
+            case Choke:
+                peerHandlerLog("Received choke message");
+                this.peerHasChoked = true;
+                //cancel any outstanding requests
+                this.cancelInFlightRequest();
+                break;
+            case Unchoke:
+                peerHandlerLog("Received unchoke message");
+                this.peerHasChoked = false;
+                break;
+            case Interested:
+                peerHandlerLog("Received interested message");
+                //Used in server to determine if we should optimistically uncloke peer
+                this.peerIsInterested.set(true);
+                break;
+            case NotInterested:
+                peerHandlerLog("Received not interested message");
+                //Used in server to determine if we should optimistically uncloke peer
+                this.peerIsInterested.set(false);
+                //We can't blindly shutdown if our bitfield is complete, if we completed our bitfield from another peer and sent a have message,
+                //our peer may not have received that yet and could be sending a Not Interested message for a previous state
+                //We should not rely on this message to shutdown and instead keep track of our peer's bitfield accurately
+                if(this.filePieces.isComplete()){
+                    //onShutdown();
+                }
+                break;
+            case Bitfield:
+                peerHandlerLog("Received bitfield message");
+                this.peerBitfield = new FilePieces.Bitfield(message.payload, this.numPieces);
+                this.piecesToRequest = filePieces.bitfield.getInterestedIndices(this.peerBitfield); 
+                if(this.piecesToRequest.size() != 0){
+                    peerHandlerLog("Sending interest messages");    
+                    Message.sendInterestedMessage(this.writer);
+                }
+                else{
+                    peerHandlerLog("Sending not interest messages");    
                     Message.sendNotInterestedMessage(this.writer);
                 }
-                checkStatusAndStopIfComplete("disconnecting after receiving piece from other peer(%d)".formatted(event.peerId()));
-            }
+                break;
+            case Have:
+                return handleHaveMessage(message);
+            case Request:
+                handleRequestMessage(message, choked);
+                break;
+            case Piece:
+                return handlePieceMessage(message);
+            default:
+                throw new BittorrentException("invalid message type: " + message.messageType);
+        }
+        return false;
+    
+    }
+
+    ArrayList<Message> getMessagesFromQueue(){
+        ArrayList<Message> messages = new ArrayList<>();
+        Message message;
+        while((message = this.messageQueue.poll()) != null){
+            messages.add(message);
+        }
+        return messages;
+    }
+
+    ArrayList<Event> getEventsFromQueue(){
+        ArrayList<Event> events = new ArrayList<>();
+        Event event;
+        while((event = this.inboundEventQueue.poll()) != null){
+            events.add(event);
+        }
+        return events;
+    }
+
+    //TODO: URGENT -> errors should stop the thread entirely, and we need a way to update the main thread that we are done serving this client
+    //TODO: rename method
+    void communicateWithPeer() throws IOException, BittorrentException {
+        peerHandlerLog("Processing messages");
+        //Maybe move this to an event queue
+        boolean prevChokeStatus = true;
+        while(!handlerShutdownSignal.get()){
+
+            boolean shouldChoke = this.shouldChoke.get();
+            
             if(shouldChoke && !prevChokeStatus){
                 peerHandlerLog("Choking peer, sending choke message");
                 Message.sendChokeMessage(this.writer);
@@ -189,211 +404,28 @@ public class PeerHandler extends Thread{
                 Message.sendUnchokeMessage(this.writer);
                 prevChokeStatus = false;
             }
-            if(!this.waitingForPiece && !this.peerHasChoked){
+
+            this.queueSemaphore.drainPermits();
+            boolean shutdownTriggered = false;
+            ArrayList<Message> messages;
+            ArrayList<Event> events;
+            synchronized(this.queueLock){
+               messages = getMessagesFromQueue();
+                events = getEventsFromQueue();
+            }
+            shutdownTriggered =  processMessages(messages, shouldChoke) || processPieceReceivedEvent(events);
+
+            if(shutdownTriggered){
+                break;
+            }
+            
+            if(!this.requestInFlight() && !this.peerHasChoked){
                 requestPiece();
             }
-            Message message;
-            message = this.messageQueue.poll();
-            if(message != null)
-            handleMessage(message);
-
         }
         peerHandlerLog("Handler for peer " + this.peerInfoCfg.peerId() + " is done");
     }
 
-
-    void handleMessage(Message message) throws BittorrentException, IOException{
-      
-        switch (message.messageType){
-            //Choke
-            case Choke:{
-                peerHandlerLog("Received choke message");
-                this.peerHasChoked = true;
-                break;
-            }
-            //Unchoke
-            case Unchoke:{
-                peerHandlerLog("Received unchoke message");
-                this.peerHasChoked = false;
-                break;
-            }
-            //Interested, NotInterested
-            case Interested:{
-                peerHandlerLog("Received interested message");
-                this.peerIsInterested.set(true);
-                break;
-            }
-            case NotInterested:{
-                peerHandlerLog("Received uninterested message");
-                this.peerIsInterested.set(false);
-                if(filePieces.isComplete()){
-                    peerHandlerLog("disconnecting after receiving uninterested message from peer (we both have the file)");
-                    disconnect();
-                }
-                break;
-            }
-            //Have
-            case Have:{
-                if(message.payload.length != 4){
-                    Logger.log("error: have message payload is not 4 bytes");
-                    throw new BittorrentException("Have message payload is not 4 bytes");
-                }
-
-                var pieceIndex = ByteBuffer.wrap(message.payload).getInt();
-                peerHandlerLog("Received have message for piece " + pieceIndex);
-                if(this.peerBitfield.get(pieceIndex)){
-                    peerHandlerLog("warning: received have message for piece that peer already has");
-                }
-                else{
-                    this.peerBitfield.set(pieceIndex);
-                }
-                int remainingPieces = 0;
-                for(int i = 0; i < this.numPieces; i++){
-                    if(!this.peerBitfield.get(i)){
-                        remainingPieces++;
-                    }
-                }
-                peerHandlerLog("Peers remaining pieces: " + remainingPieces);
-                if(!this.filePieces.bitfield.havePiece(pieceIndex)){
-                    this.piecesToRequest.add(pieceIndex);
-                    Message.sendInterestedMessage(this.writer);
-                }
-                checkStatusAndStopIfComplete("disconnecting after receiving have message (my file is complete and just learned peers is now complete)");
-                break;
-            }
-            //Bitfield message
-            case Bitfield:{
-                peerHandlerLog("Received bitfield message");
-                this.peerBitfield = new FilePieces.Bitfield(message.payload, this.numPieces);
-                this.piecesToRequest = filePieces.bitfield.getInterestedIndices(this.peerBitfield); 
-                peerHandlerLog("Sending interest messages");
-                if(this.piecesToRequest.size() != 0){
-                Message.sendInterestedMessage(this.writer);
-                }
-                else{
-                    Message.sendNotInterestedMessage(this.writer);
-                }
-                break;
-            }
-            //request message
-            case Request:{
-                peerHandlerLog("Received request message");
-                if(this.shouldChoke.get()){
-                    peerHandlerLog("warning: received request message when choked");
-                    return;
-                }
-                int pieceIndex = ByteBuffer.wrap(message.payload).getInt();
-
-                byte[] piece = this.filePieces.getPiece(pieceIndex);
-                if(piece == null){
-                    peerHandlerLog("warning: either dont have piece or piece index is out of bounds - index = " + pieceIndex);
-                    return;
-                }
-                peerHandlerLog("Sending piece message");
-                Message.sendPieceMessage(this.writer, pieceIndex, piece);
-                break;
-            }
-            //piece message
-            case Piece:{
-                
-                if(!this.waitingForPiece){
-                    peerHandlerLog("warning: received piece message when not waiting for piece");
-                    return;
-                }
-                var messageBuf = ByteBuffer.wrap(message.payload);
-                var pieceIndex = messageBuf.getInt();
-                peerHandlerLog("Received piece message for index " + pieceIndex);
-                var piece = Arrays.copyOfRange(messageBuf.array(), 4, messageBuf.array().length);
-                this.filePieces.updatePiece(piece, pieceIndex);
-                this.outboundEventQueue.add(new Event(EventType.PieceReceived, this.peerInfoCfg != null ? this.peerInfoCfg.peerId() : -1, pieceIndex));
-                try{
-                    this.chokeSemaphore.acquire();
-                    this.bytesDownloadedSinceChokeInterval += piece.length;
-                }
-                catch(InterruptedException e){
-                    peerHandlerLog("Error acquiring semaphore");
-                    throw new BittorrentException(e.getMessage());
-                }
-                finally{
-                    this.chokeSemaphore.release();
-                }
-                this.waitingForPiece = false;
-                //the requestPiece method moves the requested index to end of the list
-                this.piecesToRequest.remove(this.piecesToRequest.size() - 1);
-                if(this.piecesToRequest.isEmpty()){
-                    peerHandlerLog("Sending not interested message after receiving piece");
-                    Message.sendNotInterestedMessage(this.writer);
-                }
-                if(this.filePieces.isComplete()){
-                    peerHandlerLog("File is complete");
-                }
-                checkStatusAndStopIfComplete("disconnecting after receiving piece (we both have the file)");
-                break;
-            }
-            
-
-        }
-    }
-
-    void disconnect(){
-        this.shouldStop.set(true);
-        try{
-            if(!socket.isClosed()){
-                socket.close();
-            }
-        }
-        catch(IOException e){
-            peerHandlerLog("Error closing socket");
-        }
-    }
-    void checkStatusAndStopIfComplete(){
-        if(shouldStop()){
-            disconnect();
-        }
-    }
-    void checkStatusAndStopIfComplete(Object message){
-        if(shouldStop()){
-            peerHandlerLog(message);
-            disconnect();
-        }
-    }
-
-    //TODO: update to use BitSet. We can also keep track of peer completion better by using a bool and keeping track of the peer's remaining pieces
-    boolean shouldStop(){
-        if(!this.filePieces.isComplete()){
-            return false;
-        }
-        for(int i = 0; i < this.numPieces; i++){
-            if(!this.peerBitfield.get(i)){
-                return false;
-            }
-        }
-        return true;
-    }
-    void requestPiece() throws IOException{
-        if(this.piecesToRequest.size() == 0){
-            return;
-        }
-        int randomIndex = (int)(Math.random() * this.piecesToRequest.size());        
-        int pieceIndex = this.piecesToRequest.get(randomIndex);
-        this.piecesToRequest.set(randomIndex, this.piecesToRequest.get(this.piecesToRequest.size() - 1));
-        this.piecesToRequest.set(this.piecesToRequest.size() - 1, randomIndex);
-        peerHandlerLog("Requesting piece " + pieceIndex);
-        Message.sendRequestMessage(writer, pieceIndex);
-        this.waitingForPiece = true;
-    }
-
-    void sendBitfield(){
-        try{
-            var bitfieldBytes = this.filePieces.bitfield.getBytes();
-            Message message = new Message(Message.MessageType.Bitfield, bitfieldBytes);
-            Message.toOutputStream(this.writer, message);
-        }
-        catch (IOException e){
-            peerHandlerLog("Error sending bitfield");
-        }
-    }
-    
     public void run(){
         try {
             this.socket.setSoTimeout(10000 * 25);
@@ -417,24 +449,83 @@ public class PeerHandler extends Thread{
             }.init(this);
     
             this.readerThread.start();
-            processMessageQueue();
+            communicateWithPeer();
         } 
         catch (IOException e) {
             e.printStackTrace();
+
         }
         catch(BittorrentException e){
             peerHandlerLog(e.getMessage());
-        }
-        catch(InterruptedException e){
-            peerHandlerLog("Thread interrupted: " + e.getMessage());
+
         }
         finally{
-            shutdown();
+            peerHandlerLog("Disconnecting");
+            notifyThreadsToStop();
+            if(!this.shutdownByServer){
+                int peerId = this.peerInfoCfg != null ? this.peerInfoCfg.peerId() : -1;
+                this.serverListener.onPeerDisconnected(peerId);
+            }
+            try{
+                if(this.readerThread != null && this.readerThread.isAlive()){
+                    this.readerThread.join();
+                }
+            }
+            catch(InterruptedException e){
+                peerHandlerLog("Error joining reader thread");
+            }
         }
-        
-    
-
         return;
+        
+    }
+
+    //TODO: update to use BitSet. We can also keep track of peer completion better by using a bool and keeping track of the peer's remaining pieces
+    boolean bothPeersHaveCompleteFile(){
+        if(!this.filePieces.isComplete()){
+            return false;
+        }
+        for(int i = 0; i < this.numPieces; i++){
+            if(!this.peerBitfield.get(i)){
+                return false;
+            }
+        }
+        return true;
+    }
+    boolean bothPeersHaveCompleteFile(Object message){
+        peerHandlerLog(message);
+        return bothPeersHaveCompleteFile();
+    }
+
+    void sendBitfield(){
+        try{
+            var bitfieldBytes = this.filePieces.bitfield.getBytes();
+            Message message = new Message(Message.MessageType.Bitfield, bitfieldBytes);
+            Message.toOutputStream(this.writer, message);
+        }
+        catch (IOException e){
+            peerHandlerLog("Error sending bitfield");
+        }
+    }
+
+    //Releases semaphore and closed socket to prevent infinite blocking
+    //Sets shutdown signal to true to break any loops
+    void notifyThreadsToStop(){
+        this.handlerShutdownSignal.set(true);
+        if(!this.socket.isClosed()){
+            try{
+                this.socket.close();
+            }
+            catch(IOException e){
+                peerHandlerLog("Error closing socket");
+            }
+        }
+        this.queueSemaphore.release();
+    }
+
+    //Used by server to trigger shutdown to all handlers
+    public void onServerShutdown(){
+        this.shutdownByServer = true;
+        notifyThreadsToStop();
     }
 
     void peerHandlerLog(Object message){
