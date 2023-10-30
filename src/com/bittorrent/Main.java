@@ -59,11 +59,20 @@ public class Main {
         //Logger.log(commonCfg);
         //Logger.log(peerCfgs);
         var path = Path.of("peer_" + hostId);
+        Server server;
         if(!Files.exists(path)){
             Files.createDirectory(path);
         }
-        Server server = new Server(hostId, commonCfg, peerCfgs);
-        server.start();        
+        try{
+             server = new Server(hostId, commonCfg, peerCfgs);
+             server.start();
+        }
+        catch(BittorrentException | IOException e){
+            Logger.log("Finished with error: " + e.getMessage());
+            return;
+        }
+        Logger.log("finished successfully, writing to file for host %d".formatted(hostId));
+        server.fileBitfield.writeToFile(path.toString());
         Logger.log("Finished");
     }
 

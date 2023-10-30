@@ -15,6 +15,7 @@ import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 
 import javax.management.RuntimeErrorException;
 
@@ -77,7 +78,6 @@ public class Server implements ServerListener{
     BlockingQueue<TimerType> timerQueue;
     ConcurrentLinkedQueue<Event> eventQueue = new ConcurrentLinkedQueue<>();
     //we use this semaphore to wait on both the timer queue and event queue
-    Semaphore queueSemaphore = new Semaphore(0);
     //we use this lock to make sure threads that call listener methods do not update queues while we are processing
 
     final Object queueLock = new Object();
@@ -85,6 +85,8 @@ public class Server implements ServerListener{
      //Can be set to true by Timer threads
      //Might only use for timer, disconnect event should 
      AtomicBoolean shutdownSignal = new AtomicBoolean(false);
+     //TODO: Consider refactoring and 
+     AtomicBoolean handlerException = new AtomicBoolean(false);
    
     public Server(int hostId, CommonConfig commonCfg, ArrayList<PeerInfoConfig> peerInfoCfgs) throws BittorrentException {
         this.commonCfg = commonCfg;
@@ -119,8 +121,8 @@ public class Server implements ServerListener{
     }
 
     boolean handleDisconnectedFromPeerEvent(Event event){
-        Logger.log("Removing handler for peer: " + event.peerId() + " from list of handlers");
-        this.handlers.removeIf(handler -> handler.peerInfoCfg != null && handler.peerInfoCfg.peerId() == event.peerId());
+        Logger.log("Removing handler for handler: " + event.peerId() + " from list of handlers");
+        this.handlers.removeIf(handler -> handler.handlerId == event.peerId());
         if(this.handlers.size() == 0){
             Logger.log("All peers disconnected");
             return true;
@@ -128,15 +130,19 @@ public class Server implements ServerListener{
         return false;
     }
 
+    //Initializes server socket and file/bitfield
+    //Assumes all peers with peer id less than this host's peer id have already started
+    //Then waits for all peers with peer id greater than this host's peer id to connect
+    //Handler array is populated and hanlder threads are started
     void initAndStartHandlers() throws IOException, BittorrentException{
         this.serverSocket = new ServerSocket(this.hostConfig.port());
-        this.fileBitfield = new FilePieces(this.commonCfg, "peer_" + this.hostConfig.peerId(), this.hostConfig.hasFile());
-        for (var peerCfg: this.peerInfoCfgs) {
+        for (int i = 0; i < this.peerInfoCfgs.size(); i++) {
+            var peerCfg = this.peerInfoCfgs.get(i);
             if(peerCfg.peerId() == this.hostConfig.peerId()){
                 break;
             }
             Socket socket = new Socket(peerCfg.hostName(), peerCfg.port());
-            var handler = new PeerHandler(socket, this.fileBitfield, this.hostConfig, peerCfg, this.commonCfg, this, this.chokeSemaphore);
+            var handler = new PeerHandler(i, socket, this.fileBitfield, this.hostConfig, peerCfg, this.commonCfg, this, this.chokeSemaphore);
             handlers.add(handler);
             handler.start();
         }
@@ -144,14 +150,17 @@ public class Server implements ServerListener{
         //TODO: Review doc to make sure this is valid, otherwise we may have to create a separate thread for accepting connections
         while(handlers.size() != peerInfoCfgs.size() - 1){
             var socket = this.serverSocket.accept();
-            var handler = new PeerHandler(socket, this.fileBitfield, this.hostConfig, null, this.commonCfg, this, this.chokeSemaphore);
+            var handler = new PeerHandler(handlers.size(), socket, this.fileBitfield, this.hostConfig, null, this.commonCfg, this, this.chokeSemaphore);
             handlers.add(handler);
             handler.start();
         }
         Logger.log("All peers connected");
 
     }
+
+    //Initializes file/bitfield, starts timer threads, inits + starts handlers, and runs protocol
     public void start() throws IOException, BittorrentException {
+        this.fileBitfield = new FilePieces(this.commonCfg, "peer_" + this.hostConfig.peerId(), this.hostConfig.hasFile());
         try{
             initAndStartHandlers();
         }
@@ -166,6 +175,11 @@ public class Server implements ServerListener{
         //start choke process 
         startTimerThreads();
         runProtocol();
+        //TODO: use exception info or change it to a different type
+        boolean e = this.handlerException.get();
+        if(e){
+            Logger.log("[SHUTDOWN] Error in handler");
+        }
         shutdown();
     }
 
@@ -228,15 +242,27 @@ public class Server implements ServerListener{
 
         while(!this.shutdownSignal.get()){
             //TODO: review logic again and make sure that drainPermits will NEVER wait forever
-            this.queueSemaphore.drainPermits();
-
             ArrayList<TimerType> timerEvents = new ArrayList<>();
             ArrayList<Event> handlerEvents = new ArrayList<>();
-
+            Logger.log("[LOCKING] Attempting to acquire queue lock in server thread");
             synchronized(this.queueLock){
+                //TODO: use timeout overload in case there is an error and wait indefinieely
+                Logger.log("[LOCKING] Waiting for notification");
+
+                try{
+                    this.queueLock.wait();
+                }
+                catch(InterruptedException e){
+                    Logger.log("[ERROR] Interrupted while waiting for notification");
+                    this.shutdownSignal.set(true);
+                    break;
+                }
+                Logger.log("[LOCKING] Notified, %d timer events, %d handler events".formatted(this.timerQueue.size(), this.eventQueue.size()));
                 timerEvents = getTimerEvents();
                 handlerEvents = getEvents();
             }
+            Logger.log("[UNLOCKED] Lock released");
+
             boolean allPeersDisconnected = processEvents(handlerEvents, receivedPieces);
             if(allPeersDisconnected){
                 break;
@@ -256,16 +282,17 @@ public class Server implements ServerListener{
             return;
         }
         //Stop all peers from updating their download rate (may refactor this or just not synchronize, as it's not a big deal)
-        int permits = this.chokeSemaphore.drainPermits();
+        //int permits = this.chokeSemaphore.drainPermits();
         PriorityQueue<PeerHandler> queue = new PriorityQueue<>((h1, h2) -> h2.bytesDownloadedSinceChokeInterval - h1.bytesDownloadedSinceChokeInterval);
         queue.addAll(this.handlers);
         int numberOfPreferredNeighbors = Math.min(commonCfg.numberOfPreferredNeighbors(), this.handlers.size());
-        int[] unchokedPeerIds = new int[numberOfPreferredNeighbors];
+        String[] unchokedPeerIds = new String[numberOfPreferredNeighbors];
         for(int i = 0; i < numberOfPreferredNeighbors; i++){
             var handler = queue.poll();
             handler.unchokePeer();
             handler.bytesDownloadedSinceChokeInterval = 0;
-            unchokedPeerIds[i] = handler.peerInfoCfg != null ? handler.peerInfoCfg.peerId() : -1;
+            int peerId = handler.peerInfoCfg != null ? handler.peerInfoCfg.peerId() : -1;
+            unchokedPeerIds[i] = "(Handler ID: %d, Peer ID: %d)".formatted(handler.handlerId, peerId);
         }
         Logger.log("Unchoked peers: " + Arrays.toString(unchokedPeerIds));
         synchronized(this.fileBitfield){
@@ -275,13 +302,15 @@ public class Server implements ServerListener{
             handler.chokePeer();
             handler.bytesDownloadedSinceChokeInterval = 0;
         }
-        this.chokeSemaphore.release(permits);
+        //this.chokeSemaphore.release(permits);
     }
 
-    //According to the spec, a neighbor can be both preferred and optimistically unchoked
+    //According to the spec, a neighbor can be both preferred(already unchoked) and optimistically unchoked
     //Currently we are not doing this, as we only choose from choked+interested peers, rather than just interested
     void optimisticUnchoke(){
+        Logger.log("[OPT-UNCHOKE] Optimistically unchoking peer");
         if(this.handlers.isEmpty()){
+            Logger.log("[OPT-UNCHOKE] No peers to optimistically unchoke");
             return;
         }
         ArrayList<PeerHandler> chokedAndInterested = new ArrayList<>();
@@ -292,19 +321,23 @@ public class Server implements ServerListener{
             }
         }
         if(chokedAndInterested.isEmpty()){
+            Logger.log("[OPT-UNCHOKE] No choked and interested peers to optimistically unchoke");
             return;
         }
         int randomIndex = (int)(Math.random() * chokedAndInterested.size());
         var handler = chokedAndInterested.get(randomIndex);
         handler.unchokePeer();
-        Logger.log("Optimistically unchoked peer: " + handler.peerInfoCfg != null ? handler.peerInfoCfg.peerId() : -1);
+        Logger.log("[OPT-UNCHOKE] Optimistically unchoked peer: " + (handler.peerInfoCfg != null ? handler.peerInfoCfg.peerId() : -1));
     }
 
-    //Listener implementation
+    //Listener implementations
     public void onTimeout(TimerType type) throws BittorrentException {
         synchronized(this.queueLock){
-            this.timerQueue.add(type);
-            this.queueSemaphore.release();
+            boolean added = this.timerQueue.offer(type);
+            if(!added){
+                Logger.log("Failed to add timer event to queue for type: " + type);
+            }
+            this.queueLock.notify();
         }
     }
 
@@ -313,7 +346,7 @@ public class Server implements ServerListener{
         synchronized(this.queueLock){
             var event = new Event(EventType.DisconnectedFromPeer, peerId, -1);
             this.eventQueue.add(event);
-            this.queueSemaphore.release();
+            this.queueLock.notify();
         }
     }
 
@@ -321,16 +354,20 @@ public class Server implements ServerListener{
         synchronized(this.queueLock){
             var event = new Event(EventType.PieceReceived, peerId, pieceIndex);
             this.eventQueue.add(event);
-            this.queueSemaphore.release();
+            this.queueLock.notify();
         }
     }
 
     public void onError() {
+        //Setting this without synchronization may cays
+        this.handlerException.set(true);
         this.shutdownSignal.set(true);
+        this.queueLock.notify();
     }
 
     void shutdown() {
-        this.timerQueue.poll();
+        //pretty sure this won't block
+        this.timerQueue.clear();
         this.shutdownSignal.set(true);
         if(this.serverSocket != null){
             try{
@@ -348,21 +385,28 @@ public class Server implements ServerListener{
                 handler.join();
             }
             catch(InterruptedException e){
-                Logger.log("Thread interrupted on shutdown: " + e.getMessage());
+                Logger.log("Handler Thread interrupted on shutdown: " + e.getMessage());
             }
        }
+       try{
+            this.unchokeThread.join();
+            this.optimisticUnchokeThread.join();
+       }
+       catch(InterruptedException e){
+            Logger.log("Timer Thread interrupted on shutdown: " + e.getMessage());
+        }
        Logger.log("Server shutdown complete");
     }
 
     void shutdown(BittorrentException e) throws BittorrentException { 
-        Logger.log("Shutting down server with exception");
+        Logger.log("Shutting down server with Bittorrent exception");
         this.shutdownSignal.set(true);
         shutdown();
         throw e;
     }
 
     void shutdown(IOException e) throws IOException { 
-        Logger.log("Shutting down server with exception");
+        Logger.log("Shutting down server with IO exception");
         this.shutdownSignal.set(true);
         shutdown();
         throw e;

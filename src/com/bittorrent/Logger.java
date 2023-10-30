@@ -36,6 +36,18 @@ public class Logger {
         }
     }
 
+    public static void logErr(Object message){
+        String log = "[%s]: Peer [%s] [ERROR]: %s".formatted(new Timestamp(System.currentTimeMillis()), hostId, message);
+        System.out.println(log);
+        if(Logger.out != null){
+            try {
+                Logger.out.write((log + "\n").getBytes());
+            } catch (IOException e) {
+                System.out.println("Error writing to log file");
+            };
+        }
+    }
+
     public static void log(Object message, int peerId){
         System.out.println("[%s]: Peer [%s] %s".formatted(new Timestamp(System.currentTimeMillis()), hostId, message));
         
