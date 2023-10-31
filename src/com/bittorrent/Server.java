@@ -351,6 +351,7 @@ public class Server implements ServerListener{
     }
 
     public void onPieceReceived(int pieceIndex, int peerId) {
+        Logger.log("[RECEIVED]: called server onPieceReceived for peer: " + peerId + ", pieceIndex: " + pieceIndex);
         synchronized(this.queueLock){
             var event = new Event(EventType.PieceReceived, peerId, pieceIndex);
             this.eventQueue.add(event);

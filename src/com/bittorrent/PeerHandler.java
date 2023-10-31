@@ -90,10 +90,16 @@ public class PeerHandler extends Thread implements PeerListener{
 
     public void chokePeer(){
         this.shouldChoke.set(true);
+        synchronized(this.queueLock){
+            this.queueLock.notify();
+        }
     }
 
     public void unchokePeer(){
         this.shouldChoke.set(false);
+        synchronized(this.queueLock){
+            this.queueLock.notify();
+        }
     }
 
     public boolean isChokingPeer(){
@@ -198,17 +204,21 @@ public class PeerHandler extends Thread implements PeerListener{
                 //TODO: remove
                 throw new RuntimeException("received invalid event type in pieceReceived handler");
             }
-            peerHandlerLog("[PIECE_RECEIVED_EV] Received piece %d from peer %d, sending HAVE message".formatted(event.pieceIndex(), event.peerId()));
-            Message.sendHaveMessage(writer, event.pieceIndex());
+
             int pieceIndex = event.pieceIndex();
             //Ignore piece if it matches the piece we are currently requesting, we'll wait for the piece message associated with our request
             if(pieceIndex == this.pieceIndexInFlight){
                 peerHandlerLog("[PIECE_RECEIVED_EV] Received piece %d from peer %d, which matches in flight request, ignoring".formatted(event.pieceIndex(), event.peerId()));
                 return false;
             }
-            int prevSize = this.piecesToRequest.size();
-            this.piecesToRequest.removeIf((Integer j) -> j == pieceIndex);
-            if(prevSize > 0 && this.piecesToRequest.isEmpty()){
+            peerHandlerLog("[PIECE_RECEIVED_EV] Received piece %d from peer %d, sending HAVE message".formatted(event.pieceIndex(), event.peerId()));
+            Message.sendHaveMessage(writer, event.pieceIndex());
+            
+            boolean indexWasRemoved = this.piecesToRequest.removeIf((Integer j) -> j == pieceIndex);
+            if(!indexWasRemoved){
+                peerHandlerLog("[PIECE_RECEIVED_EV] Received piece %d from peer %d, but we were not expecting this piece".formatted(event.pieceIndex(), event.peerId()));
+            }
+            if(indexWasRemoved && this.piecesToRequest.isEmpty()){
                 peerHandlerLog("Sending not interested message after receiving piece %d from different peer %d".formatted(event.pieceIndex(), event.peerId()));
                 Message.sendNotInterestedMessage(this.writer);
             }
@@ -262,7 +272,11 @@ public class PeerHandler extends Thread implements PeerListener{
             throw new BittorrentException("invalid piece index: " + pieceIndex);
         }
         this.peerBitfield.set(pieceIndex);
-        if(!this.filePieces.bitfield.havePiece(pieceIndexInFlight)){
+        if(!this.filePieces.bitfield.havePiece(pieceIndex)){
+            if(this.piecesToRequest.isEmpty()){
+                peerHandlerLog("Sending interested message after receiving have message for piece " + pieceIndex + " while having empty request queue");
+                Message.sendInterestedMessage(this.writer);
+            }
             if(requestInFlight()){
                 this.piecesToRequest.set(this.piecesToRequest.size() -1, pieceIndex);
                 this.piecesToRequest.add(this.pieceIndexInFlight);
@@ -270,17 +284,15 @@ public class PeerHandler extends Thread implements PeerListener{
             else{
                 this.piecesToRequest.add(pieceIndex);
             }
-            peerHandlerLog("Sending interested message after receiving have message for piece " + pieceIndex);
-            Message.sendInterestedMessage(this.writer);
         }
         return bothPeersHaveCompleteFile("disconnecting after receiving have message from peer");
     }
-    void handleRequestMessage(Message message, boolean choked) throws BittorrentException, IOException{
+    boolean handleRequestMessage(Message message, boolean choked) throws BittorrentException, IOException{
         int pieceIndex = ByteBuffer.wrap(message.payload).getInt();
         peerHandlerLog("Received request message for piece " + pieceIndex);
         if(choked){
             peerHandlerLog("[WARNING]: Received request message while choked");
-            return;
+            return false;
         }
         if(pieceIndex < 0 || pieceIndex >= this.numPieces){
             throw new BittorrentException("invalid piece index: " + pieceIndex);
@@ -292,8 +304,10 @@ public class PeerHandler extends Thread implements PeerListener{
         if(piece == null){
             throw new BittorrentException("peer requested piece index %d which we do not have".formatted(pieceIndex));
         }
+        peerHandlerLog("Sending piece message for piece " + pieceIndex);
         Message.sendPieceMessage(this.writer, pieceIndex, piece);
         this.peerBitfield.set(pieceIndex);
+        return bothPeersHaveCompleteFile("disconnecting after sending piece %d to peer".formatted(pieceIndex));
     }
 
     boolean handlePieceMessage(Message message) throws BittorrentException{
@@ -341,7 +355,7 @@ public class PeerHandler extends Thread implements PeerListener{
                 break;
             case Interested:
                 peerHandlerLog("Received interested message");
-                //Used in server to determine if we should optimistically uncloke peer
+                //Used in server to determine if we should optimistically unchoke peer
                 this.peerIsInterested.set(true);
                 break;
             case NotInterested:
@@ -371,8 +385,7 @@ public class PeerHandler extends Thread implements PeerListener{
             case Have:
                 return handleHaveMessage(message);
             case Request:
-                handleRequestMessage(message, choked);
-                break;
+                return handleRequestMessage(message, choked);
             case Piece:
                 return handlePieceMessage(message);
             default:
@@ -443,7 +456,7 @@ public class PeerHandler extends Thread implements PeerListener{
                messages = getMessagesFromQueue();
                events = getEventsFromQueue();
             }
-            shutdownTriggered =  processMessages(messages, shouldChoke) || processPieceReceivedEvent(events);
+            shutdownTriggered = processMessages(messages, shouldChoke) || processPieceReceivedEvent(events);
 
             if(shutdownTriggered){
                 break;
