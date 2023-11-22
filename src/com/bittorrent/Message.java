@@ -5,6 +5,8 @@ import java.io.DataOutputStream;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 
+import com.bittorrent.Message.MessageType;
+
 public class Message {
     enum MessageType{
         Choke,
@@ -37,7 +39,7 @@ public class Message {
     public static Message fromInputStream(DataInputStream stream, int maxPayloadSize) throws IOException, BittorrentException {
         var messageLength = stream.readInt();
         if(messageLength > maxPayloadSize){
-            throw new BittorrentException("message length to big: " + messageLength);
+            throw new BittorrentException("message length too big: " + messageLength);
         }
         var messageType = MessageType.fromByte(stream.readByte());
         if(messageType == null){
@@ -55,6 +57,12 @@ public class Message {
         }
         stream.write(buf.array());
         stream.flush();
+    }
+
+    public static void sendBitfieldMessage(DataOutputStream stream, FilePieces file) throws IOException {
+        var bitfieldBytes = file.bitfield.getBytes();
+        Message message = new Message(Message.MessageType.Bitfield, bitfieldBytes);
+        Message.toOutputStream(stream, message);
     }
 
     public static void sendInterestedMessage(DataOutputStream stream) throws IOException {

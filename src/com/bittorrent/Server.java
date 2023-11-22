@@ -77,14 +77,15 @@ public class Server implements ServerListener{
     
     BlockingQueue<TimerType> timerQueue;
     ConcurrentLinkedQueue<Event> eventQueue = new ConcurrentLinkedQueue<>();
-    //we use this semaphore to wait on both the timer queue and event queue
-    //we use this lock to make sure threads that call listener methods do not update queues while we are processing
 
+    //Queue to wait/notify on when events are added to the queue
     final Object queueLock = new Object();
+
     //Used from separate threads when an error occurs
      //Can be set to true by Timer threads
-     //Might only use for timer, disconnect event should 
+     //Might only use for timer, disconnect event should be enough for handler threads
      AtomicBoolean shutdownSignal = new AtomicBoolean(false);
+
      //TODO: Consider refactoring and 
      AtomicBoolean handlerException = new AtomicBoolean(false);
    
@@ -106,28 +107,6 @@ public class Server implements ServerListener{
             throw new BittorrentException("Host id not found in peer info cfgs");
         }
         Logger.log(this.hostConfig);
-    }
-
-    void handlePieceReceivedEvent(Event event, HashSet<Integer> receivedPieces){
-        if(receivedPieces.contains(event.pieceIndex())){
-            return;
-        }
-        receivedPieces.add(event.pieceIndex());
-        for(var handler: this.handlers){
-            if(handler.peerInfoCfg != null && handler.peerInfoCfg.peerId() != event.peerId()){
-                handler.onPieceReceived(event);
-            }
-        }
-    }
-
-    boolean handleDisconnectedFromPeerEvent(Event event){
-        Logger.log("Removing handler for handler: " + event.peerId() + " from list of handlers");
-        this.handlers.removeIf(handler -> handler.handlerId == event.peerId());
-        if(this.handlers.size() == 0){
-            Logger.log("All peers disconnected");
-            return true;
-        }
-        return false;
     }
 
     //Initializes server socket and file/bitfield
@@ -175,7 +154,6 @@ public class Server implements ServerListener{
         //start choke process 
         startTimerThreads();
         runProtocol();
-        //TODO: use exception info or change it to a different type
         boolean e = this.handlerException.get();
         if(e){
             Logger.log("[SHUTDOWN] Error in handler");
@@ -215,6 +193,28 @@ public class Server implements ServerListener{
         }
     }
 
+    void handlePieceReceivedEvent(Event event, HashSet<Integer> receivedPieces){
+        if(receivedPieces.contains(event.pieceIndex())){
+            return;
+        }
+        receivedPieces.add(event.pieceIndex());
+        for(var handler: this.handlers){
+            if(handler.peerInfoCfg != null && handler.peerInfoCfg.peerId() != event.peerId()){
+                handler.onPieceReceived(event);
+            }
+        }
+    }
+
+    boolean handleDisconnectedFromPeerEvent(Event event){
+        Logger.log("Removing handler for handler: " + event.peerId() + " from list of handlers");
+        this.handlers.removeIf(handler -> handler.handlerId == event.peerId());
+        if(this.handlers.size() == 0){
+            Logger.log("All peers disconnected");
+            return true;
+        }
+        return false;
+    }
+
     ArrayList<TimerType> getTimerEvents(){
         ArrayList<TimerType> events = new ArrayList<>();
         for(int i = 0; i < 2; i++){
@@ -237,26 +237,28 @@ public class Server implements ServerListener{
     }
 
     public void runProtocol(){
-        //We don't want to update handlers about pieces they already know we've received
+        //We don't want to notify handlers about pieces they already know we've received
         HashSet<Integer> receivedPieces = new HashSet<>();
 
         while(!this.shutdownSignal.get()){
-            //TODO: review logic again and make sure that drainPermits will NEVER wait forever
             ArrayList<TimerType> timerEvents = new ArrayList<>();
             ArrayList<Event> handlerEvents = new ArrayList<>();
             Logger.log("[LOCKING] Attempting to acquire queue lock in server thread");
             synchronized(this.queueLock){
                 //TODO: use timeout overload in case there is an error and wait indefinieely
                 Logger.log("[LOCKING] Waiting for notification");
-
-                try{
-                    this.queueLock.wait();
-                }
-                catch(InterruptedException e){
-                    Logger.log("[ERROR] Interrupted while waiting for notification");
-                    this.shutdownSignal.set(true);
-                    break;
-                }
+                //TODO: check if queues are empty before waiting
+                //if(this.timerQueue.isEmpty() && this.eventQueue.isEmpty()){
+                    try{
+                        this.queueLock.wait();
+                    }
+                    catch(InterruptedException e){
+                        Logger.log("[ERROR] Interrupted while waiting for notification");
+                        this.shutdownSignal.set(true);
+                        break;
+                    }
+                //}
+                
                 Logger.log("[LOCKING] Notified, %d timer events, %d handler events".formatted(this.timerQueue.size(), this.eventQueue.size()));
                 timerEvents = getTimerEvents();
                 handlerEvents = getEvents();

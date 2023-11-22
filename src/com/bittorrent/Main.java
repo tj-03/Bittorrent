@@ -56,8 +56,6 @@ public class Main {
             }
         }
 
-        //Logger.log(commonCfg);
-        //Logger.log(peerCfgs);
         var path = Path.of("peer_" + hostId);
         Server server;
         if(!Files.exists(path)){
