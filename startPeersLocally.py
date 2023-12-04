@@ -1,5 +1,6 @@
 
 import subprocess
+from time import sleep
 f = open("PeerInfo.cfg", "r")
 lines = f.readlines()
 
@@ -10,6 +11,9 @@ for line in lines:
     peerNums.append(peerNum)
 
 print(peerNums)
+#peerNums = peerNums[1:]
 for peerNum in peerNums:
-    cmd =  f"C:/Users/josep/.jdks/jdk-19.0.2/bin/java.exe -classpath C:/Users/josep/Desktop/java_stuff/bittorrent/out/production/bittorrent com.bittorrent.Main {peerNum} true"
+    cmd =  f"java -classpath bin com.bittorrent.Main {peerNum} true"
+   # print("Starting peer " + peerNum + " locally")
     subprocess.Popen(cmd, shell=True)
+    sleep(.2)
