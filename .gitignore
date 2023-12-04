@@ -3,3 +3,8 @@ out
 bittorrent.iml
 bin
 .vscode
+peer_*
+# /log*
+# vs-bin
+# /saved_logs
+# /src11

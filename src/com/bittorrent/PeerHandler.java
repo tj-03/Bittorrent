@@ -192,7 +192,7 @@ public class PeerHandler extends Thread implements PeerListener{
             //Ignore piece if it matches the piece we are currently requesting, we'll wait for the piece message associated with our request
             if(pieceIndex == this.pieceIndexInFlight){
                 peerHandlerLog("[PIECE_RECEIVED_EV] Received piece %d from peer %d, which matches in flight request, ignoring".formatted(event.pieceIndex(), event.peerId()));
-                return false;
+                continue;
             }
             peerHandlerLog("[PIECE_RECEIVED_EV] Received piece %d from peer %d, sending HAVE message".formatted(event.pieceIndex(), event.peerId()));
             Message.sendHaveMessage(writer, event.pieceIndex());
