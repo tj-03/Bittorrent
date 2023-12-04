@@ -318,7 +318,7 @@ public class Server implements ServerListener{
         ArrayList<PeerHandler> chokedAndInterested = new ArrayList<>();
         for(var handler: this.handlers){
             //if we follow the spec, this should be: if(handler.interested())
-            if(handler.isChokingPeer() && handler.peerIsInterested.get()){
+            if(/*handler.isChokingPeer() &&*/ handler.peerIsInterested.get()){
                 chokedAndInterested.add(handler);
             }
         }
