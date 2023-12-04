@@ -14,20 +14,24 @@ The program was built using a JDK on version 19.0.2, and the remote machines onl
 To run the project locally, unzip, and use the following commands to build:
 
 
-```
+```console
 ./build.bat
 ```
 
 Or if you are on a linux machine:
 
-```
+```console
 ./build.sh
 ```
 
-Alternatively, you can manually use ```javac -cp bin -d bin {src_files} ``` to compile.
+Alternatively, you can manually use 
+```console
+javac -cp bin -d bin {src_files}
+ ``` 
+to compile.
 Then to run the program locally:
 
-```
+```console
 java -classpath bin com.bittorrent.Main {peerNum} true
 ```
 Where peerNum is the number of the peer you want to run, and the last argument is whether or not you want to run the program locally.
