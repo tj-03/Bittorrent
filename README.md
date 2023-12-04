@@ -7,7 +7,7 @@ All the work was done by Tristan Joseph (me), my teaammates did not contribute t
 All functionality for the client was implemented, but unforutunately I was not able to get the program to 
 run on the remote linux machines. 
 
-This program implements a simple version of the bittorrent
+This program implements a simple version of the bittorrent protocol, allowing multiple peers to share a file, using choking mechanisms to reduce network congestion,
 
 The program was built using a JDK on version 19.0.2, and the remote machines only had version 11. I tried to rewrite the program to be compatible with version 11, but I was not able to get it to work. 
 
